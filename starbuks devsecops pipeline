@@ -1,0 +1,80 @@
+pipeline {
+    agent any
+    tools {
+        jdk 'jdk17'
+        nodejs 'node16'
+    }
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+    }
+
+    stages {
+
+        stage ("Clean Workspace") {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage ("Git Checkout") {
+            steps {
+                git branch: 'main', url: 'https://github.com/Ayushmansen500/starbucks.git'
+            }
+        }
+
+        stage("SonarQube Analysis") {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh '''
+                        $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=starbucks \
+                        -Dsonar.projectKey=starbucks
+                    '''
+                }
+            }
+        }
+
+        stage("Quality Gate") {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token'
+                }
+            }
+        }
+
+        stage("Install NPM Dependencies") {
+            steps {
+                sh "npm install"
+            }
+        }
+
+        stage("Trivy File Scan") {
+            steps {
+                sh "trivy fs . > trivy.txt"
+            }
+        }
+
+        stage("Build Docker Image") {
+            steps {
+                sh "docker build -t starbucks ."
+            }
+        }
+
+        stage("Tag & Push to DockerHub") {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker') {
+                        sh "docker tag starbucks ayushman50/starbucks:latest"
+                        sh "docker push ayushman50/starbucks:latest"
+                    }
+                }
+            }
+        }
+
+        stage("Deploy to Container") {
+            steps {
+                sh "docker run -d --name starbucks -p 3000:3000 ayushman50/starbucks:latest"
+            }
+        }
+    }
+}
