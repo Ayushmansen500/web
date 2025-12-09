@@ -1,0 +1,114 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_IMAGE = "ayushman50/devopsexamapp:latest"
+        SCANNER_HOME = tool 'sonar-scanner'
+    }
+
+    stages {
+
+        stage('Git Checkout') {
+            steps {
+                git(
+                    url: 'https://github.com/Ayushmansen500/devops-exam-app.git',
+                    branch: 'master'
+                )
+            }
+        }
+
+        stage('File System Scan') {
+            steps {
+                sh "trivy fs --security-checks vuln,config --format table -o trivy-fs-report.html ."
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar') {
+                    sh """
+                    ${SCANNER_HOME}/bin/sonar-scanner \
+                    -Dsonar.projectName=devops-exam-app \
+                    -Dsonar.projectKey=devops-exam-app \
+                    -Dsonar.sources=. \
+                    -Dsonar.language=py \
+                    -Dsonar.python.version=3 \
+                    -Dsonar.host.url=http://localhost:9000
+                    """
+                }
+            }
+        }
+
+        stage('Verify Docker Compose') {
+            steps {
+                sh 'docker compose version'
+            }
+        }
+
+        stage('Build and Push Docker Image') {
+            steps {
+                dir('backend') {
+                    script {
+                        withDockerRegistry(credentialsId: 'docker') {
+                            sh "docker build -t ${DOCKER_IMAGE} ."
+                            sh "docker push ${DOCKER_IMAGE}"
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------- NEW TRIVY IMAGE SCAN ----------------
+        stage('Trivy Image Scan') {
+            steps {
+                sh "trivy image --security-checks vuln,config --format table -o trivy-image-report.html ${DOCKER_IMAGE}"
+            }
+        }
+
+        stage('Deploy with Docker Compose') {
+            steps {
+                sh '''
+                # 🧹 Remove all containers linked to this docker-compose project
+                docker compose ps -a --format '{{.Name}}' | xargs -r docker rm -f || true
+
+                # Extra safety: remove any leftover containers by name
+                docker rm -f mysql_db || true
+                docker rm -f flask_app || true
+
+                docker compose down --remove-orphans || true
+                docker compose up -d --build
+
+                timeout 120s bash -c '
+                    while ! docker compose exec -T mysql mysqladmin ping -uroot -prootpass --silent; do
+                        sleep 5
+                        docker compose logs mysql --tail=5 || true
+                    done
+                '
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                docker compose ps -a
+                curl -I http://localhost:5000 || true
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            sh 'docker compose ps'
+            archiveArtifacts artifacts: 'trivy-fs-report.html,trivy-image-report.html', allowEmptyArchive: true
+        }
+        failure {
+            sh 'docker compose logs --tail=50 || true'
+        }
+        always {
+            sh 'docker compose logs --tail=20 || true'
+            archiveArtifacts artifacts: 'trivy-fs-report.html,trivy-image-report.html', allowEmptyArchive: true
+        }
+    }
+}
