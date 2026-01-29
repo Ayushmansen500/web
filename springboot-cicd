@@ -1,0 +1,123 @@
+pipeline {
+    agent any
+
+    tools {
+        maven 'Maven-3'
+        jdk 'JDK-17'
+    }
+
+    environment {
+        APP_NAME  = "S-Mart-0.0.1-SNAPSHOT.jar"
+        APP_DIR   = "/home/ubuntu/S_Mart-Ecommerce-Website-Java-Project"
+        PORT      = "9090"
+        JAVA_HOME = "/usr/lib/jvm/java-17-openjdk-amd64"
+    }
+
+    stages {
+
+        stage('Environment Info') {
+            steps {
+                sh '''
+                    echo "JAVA_HOME=$JAVA_HOME"
+                    java -version
+                    mvn -version
+                '''
+            }
+        }
+
+        stage('Clone Repository') {
+            steps {
+                git branch: 'my-new-branch',
+                    url: 'https://github.com/Ayushmansen500/Smart-Eccomerce-Application-Java-Project-with-CI-CD-Automation.git'
+            }
+        }
+
+        stage('Build & Test') {
+            steps {
+                sh 'mvn clean test'
+            }
+        }
+
+        stage('Package') {
+            steps {
+                sh 'mvn clean package -DskipTests'
+            }
+        }
+
+        stage('Deploy Application') {
+    steps {
+        sh '''
+            echo "🔴 Stopping old application (if any)..."
+            sudo pkill -f ${APP_NAME} || true
+            sleep 3
+
+            echo "📁 Preparing deployment directory..."
+            sudo mkdir -p ${APP_DIR}
+            sudo chown -R ubuntu:ubuntu ${APP_DIR}
+
+            echo "📦 Copying JAR..."
+            sudo cp target/${APP_NAME} ${APP_DIR}/
+
+            echo "🚀 Starting application as ubuntu user..."
+            sudo -u ubuntu bash -c "
+              cd ${APP_DIR} &&
+              nohup ${JAVA_HOME}/bin/java \
+                -jar ${APP_NAME} \
+                --server.address=0.0.0.0 \
+                --server.port=${PORT} \
+                > app.log 2>&1 &
+            "
+
+            sleep 10
+        '''
+    }
+}
+
+
+        stage('Health Check') {
+            steps {
+                sh '''
+                    echo "🔎 Checking port ${PORT}..."
+                    sudo netstat -tlnp | grep ${PORT}
+
+                    echo "🌐 Testing application locally..."
+                    curl -I http://localhost:${PORT} || true
+                '''
+            }
+        }
+
+        stage('Deployment Summary') {
+            steps {
+                script {
+                    def publicIp = sh(
+                        script: 'curl -s http://169.254.169.254/latest/meta-data/public-ipv4',
+                        returnStdout: true
+                    ).trim()
+
+                    echo """
+✅ ============================================
+🚀 DEPLOYMENT SUCCESSFUL
+============================================
+🌐 Application URL : http://${publicIp}:${PORT}
+📂 Path            : ${APP_DIR}
+📄 Logs            : ${APP_DIR}/app.log
+============================================
+"""
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Pipeline completed successfully. Application is LIVE."
+        }
+        failure {
+            echo "❌ Pipeline failed. Check logs."
+        }
+        always {
+            echo "🧹 Cleaning Jenkins workspace only (app not affected)"
+            cleanWs()
+        }
+    }
+}
