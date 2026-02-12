@@ -1,0 +1,394 @@
+import boto3
+import json
+from botocore.exceptions import ClientError
+
+def lambda_handler(event, context):
+    """
+    Main Lambda handler function
+    """
+    
+    # Get all AWS regions
+    ec2_client = boto3.client('ec2', region_name='us-east-1')
+    regions = [region['RegionName'] for region in ec2_client.describe_regions()['Regions']]
+    
+    cleanup_summary = {
+        'successful_deletions': [],
+        'failed_deletions': [],
+        'skipped_resources': []
+    }
+    
+    print(f"Starting resource cleanup across {len(regions)} regions...")
+    
+    for region in regions:
+        print(f"\n{'='*50}")
+        print(f"Processing region: {region}")
+        print(f"{'='*50}")
+        
+        try:
+            region_results = cleanup_region(region)
+            cleanup_summary['successful_deletions'].extend(region_results['successful'])
+            cleanup_summary['failed_deletions'].extend(region_results['failed'])
+            cleanup_summary['skipped_resources'].extend(region_results['skipped'])
+        except Exception as e:
+            error_msg = f"Error processing region {region}: {str(e)}"
+            print(error_msg)
+            cleanup_summary['failed_deletions'].append(error_msg)
+    
+    print(f"\n{'='*50}")
+    print("CLEANUP SUMMARY")
+    print(f"{'='*50}")
+    print(f"Successfully Deleted: {len(cleanup_summary['successful_deletions'])}")
+    print(f"Failed Deletions: {len(cleanup_summary['failed_deletions'])}")
+    print(f"Skipped Resources: {len(cleanup_summary['skipped_resources'])}")
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps(cleanup_summary, indent=2, default=str)
+    }
+
+def cleanup_region(region):
+    """
+    Cleanup all resources in a specific region
+    """
+    results = {
+        'successful': [],
+        'failed': [],
+        'skipped': []
+    }
+    
+    # Initialize clients for this region
+    ec2 = boto3.client('ec2', region_name=region)
+    elb = boto3.client('elbv2', region_name=region)
+    eks = boto3.client('eks', region_name=region)
+    cf = boto3.client('cloudformation', region_name=region)
+    
+    # 1. Delete EKS Clusters
+    print(f"  [1/7] Deleting EKS Clusters...")
+    eks_results = delete_eks_clusters(eks, region)
+    results['successful'].extend(eks_results['successful'])
+    results['failed'].extend(eks_results['failed'])
+    
+    # 2. Delete Application Load Balancers and Network Load Balancers
+    print(f"  [2/7] Deleting Load Balancers...")
+    lb_results = delete_load_balancers(elb, region)
+    results['successful'].extend(lb_results['successful'])
+    results['failed'].extend(lb_results['failed'])
+    
+    # 3. Delete EC2 Instances
+    print(f"  [3/7] Terminating EC2 Instances...")
+    ec2_results = delete_ec2_instances(ec2, region)
+    results['successful'].extend(ec2_results['successful'])
+    results['failed'].extend(ec2_results['failed'])
+    
+    # 4. Delete NAT Gateways
+    print(f"  [4/7] Deleting NAT Gateways...")
+    nat_results = delete_nat_gateways(ec2, region)
+    results['successful'].extend(nat_results['successful'])
+    results['failed'].extend(nat_results['failed'])
+    
+    # 5. Release Elastic IPs
+    print(f"  [5/7] Releasing Elastic IPs...")
+    eip_results = release_elastic_ips(ec2, region)
+    results['successful'].extend(eip_results['successful'])
+    results['failed'].extend(eip_results['failed'])
+    
+    # 6. Delete CloudFormation Stacks
+    print(f"  [6/7] Deleting CloudFormation Stacks...")
+    cf_results = delete_cloudformation_stacks(cf, region)
+    results['successful'].extend(cf_results['successful'])
+    results['failed'].extend(cf_results['failed'])
+    
+    # 7. Delete VPCs
+    print(f"  [7/7] Deleting VPCs...")
+    vpc_results = delete_vpcs(ec2, region)
+    results['successful'].extend(vpc_results['successful'])
+    results['failed'].extend(vpc_results['failed'])
+    results['skipped'].extend(vpc_results['skipped'])
+    
+    return results
+
+def delete_eks_clusters(client, region):
+    """Delete all EKS clusters in the region"""
+    results = {'successful': [], 'failed': []}
+    
+    try:
+        clusters = client.list_clusters()['clusters']
+        
+        if not clusters:
+            print(f"    No EKS clusters found in {region}")
+            return results
+        
+        for cluster_name in clusters:
+            try:
+                print(f"    Deleting EKS Cluster: {cluster_name}")
+                client.delete_cluster(name=cluster_name)
+                results['successful'].append(f"EKS Cluster {cluster_name} deletion initiated in {region}")
+            except ClientError as e:
+                error_msg = f"Failed to delete EKS Cluster {cluster_name}: {str(e)}"
+                print(f"    ERROR: {error_msg}")
+                results['failed'].append(error_msg)
+    except Exception as e:
+        error_msg = f"Error listing EKS clusters: {str(e)}"
+        results['failed'].append(error_msg)
+    
+    return results
+
+def delete_load_balancers(client, region):
+    """Delete all load balancers (ALB/NLB)"""
+    results = {'successful': [], 'failed': []}
+    
+    try:
+        load_balancers = client.describe_load_balancers()['LoadBalancers']
+        
+        if not load_balancers:
+            print(f"    No Load Balancers found in {region}")
+            return results
+        
+        for lb in load_balancers:
+            lb_arn = lb['LoadBalancerArn']
+            lb_name = lb['LoadBalancerName']
+            
+            try:
+                print(f"    Deleting Load Balancer: {lb_name}")
+                client.delete_load_balancer(LoadBalancerArn=lb_arn)
+                results['successful'].append(f"Load Balancer {lb_name} deleted in {region}")
+            except ClientError as e:
+                error_msg = f"Failed to delete Load Balancer {lb_name}: {str(e)}"
+                print(f"    ERROR: {error_msg}")
+                results['failed'].append(error_msg)
+    except Exception as e:
+        error_msg = f"Error listing Load Balancers: {str(e)}"
+        results['failed'].append(error_msg)
+    
+    return results
+
+def delete_ec2_instances(client, region):
+    """Terminate all EC2 instances"""
+    results = {'successful': [], 'failed': []}
+    
+    try:
+        reservations = client.describe_instances(
+            Filters=[{'Name': 'instance-state-name', 'Values': ['running', 'stopped']}]
+        )['Reservations']
+        
+        instances_to_terminate = []
+        for reservation in reservations:
+            for instance in reservation['Instances']:
+                instances_to_terminate.append(instance['InstanceId'])
+        
+        if not instances_to_terminate:
+            print(f"    No EC2 instances found in {region}")
+            return results
+        
+        try:
+            print(f"    Terminating {len(instances_to_terminate)} EC2 Instance(s)")
+            client.terminate_instances(InstanceIds=instances_to_terminate)
+            results['successful'].append(f"Terminated {len(instances_to_terminate)} EC2 instances in {region}")
+        except ClientError as e:
+            error_msg = f"Failed to terminate EC2 instances: {str(e)}"
+            print(f"    ERROR: {error_msg}")
+            results['failed'].append(error_msg)
+    except Exception as e:
+        error_msg = f"Error listing EC2 instances: {str(e)}"
+        results['failed'].append(error_msg)
+    
+    return results
+
+def delete_nat_gateways(client, region):
+    """Delete all NAT gateways"""
+    results = {'successful': [], 'failed': []}
+    
+    try:
+        nat_gateways = client.describe_nat_gateways(
+            Filters=[{'Name': 'state', 'Values': ['available', 'pending']}]
+        )['NatGateways']
+        
+        if not nat_gateways:
+            print(f"    No NAT Gateways found in {region}")
+            return results
+        
+        for nat in nat_gateways:
+            nat_id = nat['NatGatewayId']
+            
+            try:
+                print(f"    Deleting NAT Gateway: {nat_id}")
+                client.delete_nat_gateway(NatGatewayId=nat_id)
+                results['successful'].append(f"NAT Gateway {nat_id} deleted in {region}")
+            except ClientError as e:
+                error_msg = f"Failed to delete NAT Gateway {nat_id}: {str(e)}"
+                print(f"    ERROR: {error_msg}")
+                results['failed'].append(error_msg)
+    except Exception as e:
+        error_msg = f"Error listing NAT Gateways: {str(e)}"
+        results['failed'].append(error_msg)
+    
+    return results
+
+def release_elastic_ips(client, region):
+    """Release all Elastic IPs that are not associated"""
+    results = {'successful': [], 'failed': []}
+    
+    try:
+        # First, disassociate all Elastic IPs from instances
+        addresses = client.describe_addresses()['Addresses']
+        
+        # Disassociate first
+        for address in addresses:
+            if 'AssociationId' in address:
+                try:
+                    assoc_id = address['AssociationId']
+                    print(f"    Disassociating Elastic IP: {address.get('PublicIp', 'N/A')}")
+                    client.disassociate_address(AssociationId=assoc_id)
+                except ClientError as e:
+                    print(f"    WARNING: Failed to disassociate: {str(e)}")
+        
+        # Now release all Elastic IPs
+        addresses = client.describe_addresses()['Addresses']
+        
+        if not addresses:
+            print(f"    No Elastic IPs found in {region}")
+            return results
+        
+        for address in addresses:
+            try:
+                if 'AllocationId' in address:
+                    alloc_id = address['AllocationId']
+                    print(f"    Releasing Elastic IP: {address.get('PublicIp', 'N/A')}")
+                    client.release_address(AllocationId=alloc_id)
+                    results['successful'].append(f"Elastic IP {address.get('PublicIp', alloc_id)} released in {region}")
+            except ClientError as e:
+                error_msg = f"Failed to release Elastic IP: {str(e)}"
+                print(f"    ERROR: {error_msg}")
+                results['failed'].append(error_msg)
+    except Exception as e:
+        error_msg = f"Error managing Elastic IPs: {str(e)}"
+        results['failed'].append(error_msg)
+    
+    return results
+
+def delete_cloudformation_stacks(client, region):
+    """Delete all CloudFormation stacks"""
+    results = {'successful': [], 'failed': []}
+    
+    try:
+        stacks = client.list_stacks(
+            StackStatusFilter=['CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE']
+        )['StackSummaries']
+        
+        if not stacks:
+            print(f"    No CloudFormation stacks found in {region}")
+            return results
+        
+        for stack in stacks:
+            stack_name = stack['StackName']
+            
+            try:
+                print(f"    Deleting CloudFormation Stack: {stack_name}")
+                client.delete_stack(StackName=stack_name)
+                results['successful'].append(f"CloudFormation Stack {stack_name} deletion initiated in {region}")
+            except ClientError as e:
+                error_msg = f"Failed to delete stack {stack_name}: {str(e)}"
+                print(f"    ERROR: {error_msg}")
+                results['failed'].append(error_msg)
+    except Exception as e:
+        error_msg = f"Error listing CloudFormation stacks: {str(e)}"
+        results['failed'].append(error_msg)
+    
+    return results
+
+def delete_vpcs(client, region):
+    """Delete all VPCs (custom VPCs, not default)"""
+    results = {'successful': [], 'failed': [], 'skipped': []}
+    
+    try:
+        vpcs = client.describe_vpcs()['Vpcs']
+        
+        for vpc in vpcs:
+            vpc_id = vpc['VpcId']
+            is_default = vpc['IsDefault']
+            
+            if is_default:
+                print(f"    Skipping default VPC: {vpc_id}")
+                results['skipped'].append(f"Default VPC {vpc_id} skipped in {region}")
+                continue
+            
+            try:
+                print(f"    Deleting VPC: {vpc_id}")
+                
+                # Delete dependencies first
+                # 1. Delete network interfaces
+                enis = client.describe_network_interfaces(
+                    Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
+                )['NetworkInterfaces']
+                
+                for eni in enis:
+                    eni_id = eni['NetworkInterfaceId']
+                    # Don't delete if it's a primary ENI
+                    if eni['Attachment']['DeviceIndex'] == 0:
+                        continue
+                    try:
+                        client.delete_network_interface(NetworkInterfaceId=eni_id)
+                    except ClientError:
+                        pass
+                
+                # 2. Delete subnets
+                subnets = client.describe_subnets(
+                    Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
+                )['Subnets']
+                
+                for subnet in subnets:
+                    try:
+                        client.delete_subnet(SubnetId=subnet['SubnetId'])
+                    except ClientError:
+                        pass
+                
+                # 3. Delete route tables (except main)
+                route_tables = client.describe_route_tables(
+                    Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
+                )['RouteTables']
+                
+                for rt in route_tables:
+                    if not rt['Associations'][0]['Main']:
+                        try:
+                            client.delete_route_table(RouteTableId=rt['RouteTableId'])
+                        except ClientError:
+                            pass
+                
+                # 4. Delete security groups (except default)
+                sgs = client.describe_security_groups(
+                    Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
+                )['SecurityGroups']
+                
+                for sg in sgs:
+                    if sg['GroupName'] != 'default':
+                        try:
+                            client.delete_security_group(GroupId=sg['GroupId'])
+                        except ClientError:
+                            pass
+                
+                # 5. Delete internet gateways
+                igws = client.describe_internet_gateways(
+                    Filters=[{'Name': 'attachment.vpc-id', 'Values': [vpc_id]}]
+                )['InternetGateways']
+                
+                for igw in igws:
+                    try:
+                        client.detach_internet_gateway(InternetGatewayId=igw['InternetGatewayId'], VpcId=vpc_id)
+                        client.delete_internet_gateway(InternetGatewayId=igw['InternetGatewayId'])
+                    except ClientError:
+                        pass
+                
+                # Finally, delete the VPC
+                client.delete_vpc(VpcId=vpc_id)
+                results['successful'].append(f"VPC {vpc_id} and its dependencies deleted in {region}")
+                
+            except ClientError as e:
+                error_msg = f"Failed to delete VPC {vpc_id}: {str(e)}"
+                print(f"    ERROR: {error_msg}")
+                results['failed'].append(error_msg)
+    except Exception as e:
+        error_msg = f"Error listing VPCs: {str(e)}"
+        results['failed'].append(error_msg)
+    
+    return results
+
