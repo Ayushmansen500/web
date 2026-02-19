@@ -1,0 +1,138 @@
+import boto3
+import json
+from datetime import datetime, timedelta
+
+ce_client = boto3.client('ce', region_name='us-east-1')
+
+def lambda_handler(event, context):
+    """
+    Fetches daily AWS costs from Cost Explorer
+    Returns service-wise cost breakdown and identifies spikes
+    """
+    
+    print("Event received:")
+    print(json.dumps(event, indent=2))
+    
+    try:
+        # Extract parameters from Bedrock
+        parameters = event.get('parameters', [])
+        
+        if not parameters:
+            param_value = "daily"
+        else:
+            param_value = parameters[0].get('value', 'daily')
+        
+        # Set date range (last 7 days)
+        end_date = datetime.utcnow().date()
+        start_date = end_date - timedelta(days=7)
+        
+        # Call Cost Explorer API
+        response = ce_client.get_cost_and_usage(
+            TimePeriod={
+                'Start': start_date.strftime('%Y-%m-%d'),
+                'End': end_date.strftime('%Y-%m-%d')
+            },
+            Granularity='DAILY',
+            Metrics=['UnblendedCost'],
+            GroupBy=[
+                {
+                    'Type': 'DIMENSION',
+                    'Key': 'SERVICE'
+                }
+            ],
+            Filter={
+                'Dimensions': {
+                    'Key': 'PURCHASE_TYPE',
+                    'Values': ['On Demand']
+                }
+            }
+        )
+        
+        # Process results
+        cost_data = {}
+        total_cost = 0
+        
+        for result in response['ResultsByTime']:
+            day = result['TimePeriod']['Start']
+            daily_total = 0
+            
+            for group in result['Groups']:
+                service = group['Keys'][0]
+                cost = float(group['Metrics']['UnblendedCost']['Amount'])
+                
+                if service not in cost_data:
+                    cost_data[service] = 0
+                
+                cost_data[service] += cost
+                daily_total += cost
+                total_cost += cost
+        
+        # Sort services by cost (highest first)
+        sorted_services = sorted(cost_data.items(), key=lambda x: x[1], reverse=True)
+        
+        # Identify top 3 cost drivers
+        top_services = sorted_services[:3]
+        
+        # Generate analysis
+        analysis = f"AWS Cost Report:\n\n"
+        analysis += f"Total 7-Day Cost: ${total_cost:.2f}\n"
+        analysis += f"Average Daily Cost: ${total_cost/7:.2f}\n\n"
+        analysis += f"Top 3 Cost Drivers:\n"
+        
+        for idx, (service, cost) in enumerate(top_services, 1):
+            percentage = (cost / total_cost * 100) if total_cost > 0 else 0
+            analysis += f"{idx}. {service}: ${cost:.2f} ({percentage:.1f}%)\n"
+        
+        # Detect spikes (if today's cost > average * 1.5)
+        today_cost = 0
+        for result in response['ResultsByTime']:
+            if result['TimePeriod']['Start'] == end_date.strftime('%Y-%m-%d'):
+                for group in result['Groups']:
+                    today_cost += float(group['Metrics']['UnblendedCost']['Amount'])
+        
+        avg_cost = total_cost / 7
+        if today_cost > avg_cost * 1.5:
+            analysis += f"\n⚠️ COST SPIKE DETECTED!\n"
+            analysis += f"Today's cost (${today_cost:.2f}) is {((today_cost/avg_cost - 1) * 100):.1f}% above average.\n"
+            analysis += f"Check these services: {', '.join([s[0] for s in top_services])}\n"
+        else:
+            analysis += f"\n✅ Costs are normal today.\n"
+        
+        # Format response for Bedrock
+        response_body = {
+            'TEXT': {
+                'body': analysis
+            }
+        }
+        
+        final_response = {
+            'messageVersion': '1.0',
+            'response': {
+                'actionGroup': event.get('actionGroup', 'CostActions'),
+                'function': event.get('function', 'getCost'),
+                'functionResponse': {
+                    'responseBody': response_body
+                }
+            }
+        }
+        
+        return final_response
+    
+    except Exception as e:
+        error_msg = f"Error fetching costs: {str(e)}"
+        print(error_msg)
+        
+        return {
+            'messageVersion': '1.0',
+            'response': {
+                'actionGroup': event.get('actionGroup', 'CostActions'),
+                'function': event.get('function', 'getCost'),
+                'functionResponse': {
+                    'responseBody': {
+                        'TEXT': {
+                            'body': f"Error: {error_msg}"
+                        }
+                    }
+                }
+            }
+        }
