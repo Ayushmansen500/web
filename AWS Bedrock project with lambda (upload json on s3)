@@ -1,0 +1,70 @@
+import json
+import boto3
+import string
+import random
+
+s3 = boto3.client("s3")
+BUCKET_NAME = "databucketsourceside9755"
+
+def lambda_handler(event, context):
+    print("EVENT RECEIVED:")
+    print(json.dumps(event, indent=2))
+
+    action_group = event.get("actionGroup")
+    function = event.get("function")
+
+    try:
+        input_text = event.get("inputText", "").strip()
+
+        # ✅ Validate JSON strictly
+        try:
+            payload = json.loads(input_text)
+        except json.JSONDecodeError:
+            return bedrock_response(
+                action_group,
+                function,
+                "Invalid JSON format. Please send ONLY valid JSON."
+            )
+
+        # Generate filename
+        filename = ''.join(
+            random.choices(string.ascii_uppercase + string.digits, k=10)
+        ) + ".json"
+
+        # Upload to S3
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=filename,
+            Body=json.dumps(payload),
+            ContentType="application/json"
+        )
+
+        return bedrock_response(
+            action_group,
+            function,
+            f"JSON uploaded successfully. File name: {filename}"
+        )
+
+    except Exception as e:
+        print("UNEXPECTED ERROR:", str(e))
+        return bedrock_response(
+            action_group,
+            function,
+            "Internal error while uploading JSON. Please try again."
+        )
+
+
+def bedrock_response(action_group, function, message):
+    return {
+        "response": {
+            "actionGroup": action_group,
+            "function": function,
+            "functionResponse": {
+                "responseBody": {
+                    "TEXT": {
+                        "body": message
+                    }
+                }
+            }
+        }
+    }
