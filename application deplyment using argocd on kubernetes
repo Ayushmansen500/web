@@ -88,6 +88,21 @@ When prompted, enter:
 • Default output format: json
 
 
+create the cluster using this command ----------->
+
+eksctl create cluster \
+  --name kastro-cluster \
+  --region ap-south-1 \
+  --node-type t3.medium \
+  --zones ap-south-1a,ap-south-1b
+
+
+after completing the project delete cluster using this command --->
+
+eksctl delete cluster \
+  --name kastro-cluster \
+  --region ap-south-1
+
 
 pipeline ------>
 
