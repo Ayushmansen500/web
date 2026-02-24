@@ -86,3 +86,180 @@ When prompted, enter:
 • AWS Secret Access Key
 • Default region: ap-south-1
 • Default output format: json
+
+
+
+pipeline ------>
+
+
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_HUB_REPO   = 'ayushman50/techsolutions-app'
+        K8S_CLUSTER_NAME = 'kastro-cluster'
+        AWS_REGION       = 'ap-south-1'
+        NAMESPACE        = 'default'
+        APP_NAME         = 'techsolutions'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code...'
+                git 'https://github.com/Ayushmansen500/microservices-ingress-kastro.git'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                echo 'Building Docker image...'
+                script {
+                    def buildNumber = env.BUILD_NUMBER
+                    env.IMAGE_TAG = buildNumber
+
+                    sh """
+                      docker build -t ${DOCKER_HUB_REPO}:${env.IMAGE_TAG} .
+                      docker tag ${DOCKER_HUB_REPO}:${env.IMAGE_TAG} ${DOCKER_HUB_REPO}:latest
+                    """
+                }
+            }
+        }
+
+        stage('Push to DockerHub') {
+            steps {
+                echo 'Pushing Docker image to DockerHub...'
+                script {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'dockerhub-creds',
+                            usernameVariable: 'DOCKER_USERNAME',
+                            passwordVariable: 'DOCKER_PASSWORD'
+                        )
+                    ]) {
+                        sh """
+                          echo \$DOCKER_PASSWORD | docker login -u \$DOCKER_USERNAME --password-stdin
+                          docker push ${DOCKER_HUB_REPO}:${env.IMAGE_TAG}
+                          docker push ${DOCKER_HUB_REPO}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Configure AWS & kubeconfig') {
+            steps {
+                echo 'Configuring AWS and kubectl...'
+                script {
+                    withCredentials([
+                        [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']
+                    ]) {
+                        sh """
+                          aws sts get-caller-identity
+                          aws eks update-kubeconfig \
+                            --region ${AWS_REGION} \
+                            --name ${K8S_CLUSTER_NAME}
+                          kubectl config current-context
+                          kubectl get nodes
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Application to EKS') {
+            steps {
+                echo 'Deploying application to Kubernetes...'
+                script {
+                    withCredentials([
+                        [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']
+                    ]) {
+                        sh """
+                          sed -i 's|ayushman50/techsolutions-app:latest|ayushman50/techsolutions-app:${env.IMAGE_TAG}|g' k8s/deployment.yaml
+                          kubectl apply -f k8s/deployment.yaml
+                          kubectl rollout status deployment/${APP_NAME}-deployment --timeout=300s
+                          kubectl get pods -l app=${APP_NAME}
+                          kubectl get svc ${APP_NAME}-service
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Ingress') {
+            steps {
+                echo 'Deploying Ingress...'
+                script {
+                    withCredentials([
+                        [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']
+                    ]) {
+                        sh """
+                          kubectl apply -f k8s/ingress.yaml
+                          sleep 10
+                          kubectl get ingress ${APP_NAME}-ingress
+                          kubectl describe ingress ${APP_NAME}-ingress
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Fetch Ingress URL & Health Check') {
+            steps {
+                echo 'Fetching Ingress URL...'
+                script {
+                    withCredentials([
+                        [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']
+                    ]) {
+                        timeout(time: 10, unit: 'MINUTES') {
+                            waitUntil {
+                                def hostname = sh(
+                                    script: "kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'",
+                                    returnStdout: true
+                                ).trim()
+
+                                if (hostname) {
+                                    env.INGRESS_URL = "http://${hostname}"
+                                    echo "Ingress URL: ${env.INGRESS_URL}"
+                                    return true
+                                }
+                                return false
+                            }
+                        }
+
+                        sh """
+                          curl -I ${env.INGRESS_URL}/ || true
+                          curl -I ${env.INGRESS_URL}/about || true
+                          curl -I ${env.INGRESS_URL}/services || true
+                          curl -I ${env.INGRESS_URL}/contact || true
+                        """
+
+                        echo "=========================================="
+                        echo "DEPLOYMENT SUCCESSFUL"
+                        echo "Application URL: ${env.INGRESS_URL}"
+                        echo "=========================================="
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+
+        always {
+            echo 'Cleaning up local Docker images...'
+            sh "docker rmi ${DOCKER_HUB_REPO}:${env.IMAGE_TAG} || true"
+            sh "docker rmi ${DOCKER_HUB_REPO}:latest || true"
+        }
+
+        success {
+            echo "Pipeline completed successfully!"
+            echo "Application live at: ${env.INGRESS_URL}"
+        }
+
+        failure {
+            echo "Pipeline failed. Check Jenkins logs."
+        }
+    }
+}
